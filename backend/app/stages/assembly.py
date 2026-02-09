@@ -10,10 +10,7 @@ from ..file_store import FileStore
 from ..job_store import JobStore
 from ..types import JobContext
 
-try:
-    from podcastfy.text_to_speech import TextToSpeech
-except Exception:  # pragma: no cover - optional dependency
-    TextToSpeech = None
+
 
 SPEAKER_TAG_RE = re.compile(r"^(Host|Guest|Speaker A|Speaker B|Narrator)\s*:\s*(.*)$", re.I | re.S)
 
@@ -52,23 +49,13 @@ class AssemblyStage:
     def __init__(self, files: FileStore) -> None:
         self.files = files
 
-    def _podcastfy_split(self, script: str) -> Optional[List[Tuple[str, str]]]:
-        if TextToSpeech is None:
-            return None
-        try:
-            tts = TextToSpeech()
-            if hasattr(tts, "split_qa"):
-                return tts.split_qa(script)
-        except Exception:
-            return None
-        return None
+
 
     def run(self, ctx: JobContext, store: JobStore) -> None:
         script_path = self.files.get_path(ctx.job_id, "script.txt")
         script = script_path.read_text(encoding="utf-8") if script_path.exists() else ctx.script or ""
 
         segments = _split_segments(script)
-        podcastfy_segments = self._podcastfy_split(script)
         duration = _duration_seconds(ctx.audio_path)
 
         episode = {
@@ -83,8 +70,7 @@ class AssemblyStage:
             "segments": segments,
         }
 
-        if podcastfy_segments:
-            episode["podcastfy_segments"] = podcastfy_segments
+
 
         episode_path = self.files.save_text(ctx.job_id, "episode.json", json.dumps(episode, indent=2, ensure_ascii=False))
         segments_path = self.files.save_text(ctx.job_id, "segments.json", json.dumps(segments, indent=2, ensure_ascii=False))
