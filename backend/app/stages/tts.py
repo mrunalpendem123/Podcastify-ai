@@ -93,31 +93,80 @@ def _chunk_text(text: str, max_chars: int = MAX_CHARS) -> List[str]:
 
 
 def _extract_segments(text: str) -> List[Tuple[Optional[str], str]]:
+    def _strip_leading_speaker_tokens(value: str) -> str:
+        cleaned = value.strip()
+        pattern = re.compile(
+            r"^(host|guest|speaker\s*[ab]|narrator)\b[\s:–—\-]*",
+            re.IGNORECASE,
+        )
+        while True:
+            new_value = pattern.sub("", cleaned, count=1).strip()
+            if new_value == cleaned:
+                break
+            cleaned = new_value
+        return cleaned
+
+    lines = [line for line in text.splitlines()]
+    line_has_label = any(
+        re.match(r"^\s*(Host|Guest|Speaker A|Speaker B|Narrator)\s*:\s*", line, re.I)
+        for line in lines
+    )
+
+    segments: List[Tuple[Optional[str], str]] = []
+    if line_has_label:
+        for line in lines:
+            raw = line.strip()
+            if not raw:
+                continue
+            match = re.match(
+                r"^(\**)?(Host|Guest|Speaker A|Speaker B|Narrator)(\**)?\s*:\s*(.*)$",
+                raw,
+                re.I | re.S,
+            )
+            if match:
+                label = (match.group(2) or "Host").strip().lower()
+                text_content = match.group(4).strip()
+                clean_match = re.match(
+                    r"^(Host|Guest|Speaker A|Speaker B|Narrator)\s*:\s*(.*)$",
+                    text_content,
+                    re.I | re.S,
+                )
+                if clean_match:
+                    text_content = clean_match.group(2).strip()
+                text_content = _strip_leading_speaker_tokens(text_content)
+                segments.append((label, text_content))
+            else:
+                if segments:
+                    prev_label, prev_text = segments[-1]
+                    segments[-1] = (prev_label, f"{prev_text} {raw}".strip())
+                else:
+                    segments.append((None, _strip_leading_speaker_tokens(raw)))
+        return segments
+
     paragraphs = _split_paragraphs(text)
     if not paragraphs:
         return []
-    segments: List[Tuple[Optional[str], str]] = []
     for paragraph in paragraphs:
-        # Check if line starts with Speaker: Text
-        match = re.match(r"^(\**)?(Host|Guest|Speaker A|Speaker B|Narrator)(\**)?\s*:\s*(.*)$", paragraph, re.I | re.S)
+        match = re.match(
+            r"^(\**)?(Host|Guest|Speaker A|Speaker B|Narrator)(\**)?\s*:\s*(.*)$",
+            paragraph,
+            re.I | re.S,
+        )
         if match:
             label = (match.group(2) or "Host").strip().lower()
             text_content = match.group(4).strip()
-            
-            # Additional cleaning: If text_content starts with "Host:" again (hallucination), strip it
-            # e.g. "Host: Host: Hello" -> "Hello"
-            # Remove any prefix like "Host: " or "Guest: " from the start of content
-            clean_match = re.match(r"^(Host|Guest|Speaker A|Speaker B|Narrator)\s*:\s*(.*)$", text_content, re.I | re.S)
+            clean_match = re.match(
+                r"^(Host|Guest|Speaker A|Speaker B|Narrator)\s*:\s*(.*)$",
+                text_content,
+                re.I | re.S,
+            )
             if clean_match:
-               text_content = clean_match.group(2).strip()
+                text_content = clean_match.group(2).strip()
 
+            text_content = _strip_leading_speaker_tokens(text_content)
             segments.append((label, text_content))
         else:
-            # Fallback for untagged paragraphs (usually continuous speech from previous speaker)
-            # Or if regex fails. Treat as continuation or try to guess.
-            # Best is to treat as None label (default speaker) or check context. 
-            # For simplicity, treat as default speaker (None -> Host/Primary)
-            segments.append((None, paragraph))
+            segments.append((None, _strip_leading_speaker_tokens(paragraph)))
     return segments
 
 

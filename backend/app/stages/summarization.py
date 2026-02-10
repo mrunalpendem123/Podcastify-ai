@@ -27,6 +27,8 @@ from ..types import JobContext
 
 SUMMARY_RATIO_DEFAULT = 0.7
 MIN_CHARS_FOR_SUMMARY = 800
+MAX_DEEPDIVE_INPUT_CHARS = int(os.getenv("MAX_DEEPDIVE_INPUT_CHARS", "120000"))
+MAX_BRIEF_INPUT_CHARS = int(os.getenv("MAX_BRIEF_INPUT_CHARS", "20000"))
 
 
 class SummarizationStage:
@@ -76,9 +78,44 @@ class SummarizationStage:
             documents.append(Document(text=fallback))
         return documents
 
-    def _ratio_for_length(self, length: str) -> float:
+    def _sample_for_deep_dive(self, sections: List[Dict[str, object]], fallback: str, max_chars: int) -> str:
+        if max_chars <= 0:
+            return ""
+        if not sections:
+            return fallback[:max_chars].strip()
+
+        ordered = [section for section in sorted(sections, key=lambda item: item.get("order", 0)) if section.get("content")]
+        if not ordered:
+            return fallback[:max_chars].strip()
+
+        per_section = max(400, max_chars // max(len(ordered), 1))
+        blocks: List[str] = []
+        total = 0
+        for section in ordered:
+            title = (section.get("title") or "").strip()
+            content = (section.get("content") or "").strip()
+            if not content:
+                continue
+
+            header = f"{title}\n" if title else ""
+            remaining = max_chars - total - len(header)
+            if remaining <= 0:
+                break
+            chunk = content[: min(per_section, remaining)].strip()
+            if not chunk:
+                continue
+            block = f"{header}{chunk}".strip()
+            blocks.append(block)
+            total += len(block) + 2
+            if total >= max_chars:
+                break
+        return "\n\n".join(blocks).strip()
+
+    def _ratio_for_length(self, length: str, original_len: int) -> float:
         if length == "slightly-shorter":
-            return float(os.getenv("SUMMARY_RATIO", SUMMARY_RATIO_DEFAULT))
+            base_ratio = float(os.getenv("SUMMARY_RATIO", SUMMARY_RATIO_DEFAULT))
+            cap_ratio = MAX_BRIEF_INPUT_CHARS / max(original_len, 1)
+            return min(base_ratio, cap_ratio)
         return 1.0
 
     def _summarize_with_llamaindex(self, documents: List[Document], ratio: float, ctx_api_key: Optional[str] = None) -> str:
@@ -119,15 +156,25 @@ class SummarizationStage:
             return False, actual_ratio
         if actual_ratio > 1.0:
             return False, actual_ratio
-        if actual_ratio < 0.35:
+        min_ratio = 0.35 if ratio >= 0.35 else max(ratio * 0.6, 0.08)
+        if actual_ratio < min_ratio:
             return False, actual_ratio
         return True, actual_ratio
 
     def run(self, ctx: JobContext, store: JobStore) -> None:
         original = ctx.raw_text or ""
-        ratio = self._ratio_for_length(ctx.length)
+        ratio = self._ratio_for_length(ctx.length, len(original))
 
-        if ratio >= 0.95 or len(original) < MIN_CHARS_FOR_SUMMARY:
+        if ctx.length == "full":
+            if len(original) <= MAX_DEEPDIVE_INPUT_CHARS or len(original) < MIN_CHARS_FOR_SUMMARY:
+                summary = original
+            else:
+                structured_path = self.files.get_path(ctx.job_id, "structured.json")
+                sections = self._load_structured_sections(structured_path)
+                summary = self._sample_for_deep_dive(sections, original, MAX_DEEPDIVE_INPUT_CHARS)
+            accepted = True
+            actual_ratio = len(summary) / max(len(original), 1)
+        elif ratio >= 0.95 or len(original) < MIN_CHARS_FOR_SUMMARY:
             summary = original
             accepted = True
             actual_ratio = 1.0
