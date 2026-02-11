@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Optional, Tuple
 
@@ -13,6 +14,10 @@ try:
     from openai import OpenAI
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None
+try:
+    import google.generativeai as genai
+except Exception:  # pragma: no cover - optional dependency
+    genai = None
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -86,14 +91,26 @@ class RewriteStage:
             normalized_lines.append(line)
         return "\n".join(normalized_lines).strip()
 
+    def _normalize_hinglish_acronyms(self, script: str) -> str:
+        if not script:
+            return script
+        # Normalize common acronyms written with spaces/dots/hyphens in any case
+        script = re.sub(r"\bs\s*\.?\s*l\s*\.?\s*m\s*s?\b", "SLMs", script, flags=re.IGNORECASE)
+        script = re.sub(r"\bl\s*\.?\s*l\s*\.?\s*m\s*s?\b", "LLMs", script, flags=re.IGNORECASE)
+        script = re.sub(r"\bg\s*\.?\s*p\s*\.?\s*t\s*[-\s]*4\s*o\b", "GPT four oh", script, flags=re.IGNORECASE)
+        script = re.sub(r"\bGPT[-\s]?4o\b", "GPT four oh", script, flags=re.IGNORECASE)
+
+        # For Hinglish, spell out as letter names (no hyphens/dots)
+        script = re.sub(r"\bSLMs\b", "Ess El Ems", script)
+        script = re.sub(r"\bLLMs\b", "El El Ems", script)
+        return script
+
     def _ensure_min_words(
         self,
-        client: OpenAI,
-        model: str,
-        system_prompt: str,
+        generate_fn,
         script: str,
         target_words: int,
-        max_tokens: int,
+        deadline: float,
     ) -> str:
         current_words = self._word_count(script)
         if current_words >= target_words:
@@ -102,6 +119,8 @@ class RewriteStage:
         attempts = 0
         combined = script.strip()
         while current_words < target_words and attempts < 3:
+            if time.time() > deadline:
+                break
             remaining = max(target_words - current_words, 200)
             continuation_prompt = (
                 "Continue the script from where it left off. "
@@ -110,19 +129,7 @@ class RewriteStage:
                 f"Add at least {remaining} new words of content. "
                 "Output ONLY the continuation lines."
             )
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": f"{continuation_prompt}\n\nCurrent script:\n{combined}",
-                    },
-                ],
-                temperature=0.6,
-                max_tokens=max_tokens,
-            )
-            addition = response.choices[0].message.content.strip()
+            addition = generate_fn(continuation_prompt, combined).strip()
             if not addition:
                 break
             combined = f"{combined}\n{addition}".strip()
@@ -149,21 +156,30 @@ class RewriteStage:
             cleaned.append(line)
         return "\n".join(cleaned).strip()
 
-    def _run_openai_direct(self, text: str, ctx: JobContext) -> Tuple[str, dict]:
-        if OpenAI is None:
-            raise RuntimeError("OpenAI package not installed")
-
-        api_key = ctx.llm_api_key or os.getenv("OPENAI_API_KEY")
-        client = OpenAI(api_key=api_key)
-        target_lang = ctx.language or "Hindi"
-        use_duo = bool(ctx.voice_secondary and ctx.voice_secondary != ctx.voice)
+    def _resolve_provider(self, ctx: JobContext) -> Tuple[str, str]:
         provider = (ctx.llm_provider or "").lower().strip()
-        model = "gpt-4o"
-        if ctx.llm_model:
-            if provider == "openai" or ctx.llm_model.startswith("openai/"):
-                model = ctx.llm_model.replace("openai/", "")
-        
-        # Determine detail level based on length param
+        model = (ctx.llm_model or "").strip()
+        if model.startswith("openai/"):
+            provider = "openai"
+            model = model.replace("openai/", "", 1)
+        elif model.startswith("gemini/"):
+            provider = "gemini"
+            model = model.replace("gemini/", "", 1)
+
+        if provider in {"google", "gemini", "googleai"}:
+            provider = "gemini"
+        if provider in {"openai", ""}:
+            provider = "openai"
+
+        if not model:
+            model = "gpt-4o" if provider == "openai" else "gemini-1.5-pro"
+        return provider, model
+
+    def _build_prompt_config(self, text: str, ctx: JobContext) -> dict:
+        target_lang = ctx.language or "Hindi"
+        allow_code_switch = target_lang.strip().lower().startswith("hinglish")
+        use_duo = bool(ctx.voice_secondary and ctx.voice_secondary != ctx.voice)
+
         is_deep_dive = ctx.length == "full"
         desired_minutes = "10-15" if is_deep_dive else "2-5"
         min_words = (
@@ -199,16 +215,38 @@ class RewriteStage:
             format_rule = "Each line MUST start with 'Narrator:'."
             example_block = "Narrator: Let’s start with the core idea."
 
+        language_rule = (
+            f"The entire conversation MUST be in {target_lang}."
+            if not allow_code_switch
+            else "Use Hinglish: a natural mix of Hindi and English in Roman script, casual Gen‑Z tone."
+        )
+
+        tts_acronym_rule = (
+            "TTS OPTIMIZATION: spell out acronyms/initialisms as letter names in the target language "
+            "(e.g., 'SLMs' -> 'Ess El Ems' in English; in other languages, transliterate the letter names). "
+            "Avoid raw abbreviations like 'SLMs' or 'GPT-4o'."
+            if not allow_code_switch
+            else "TTS OPTIMIZATION (Hinglish): spell acronyms as letter names with spaces: "
+            "'SLMs' -> 'Ess El Ems', 'LLMs' -> 'El El Ems', 'GPT-4o' -> 'G P T four oh'. "
+            "Do NOT use hyphens or dots."
+        )
+
         system_prompt = (
             "You are an expert podcast scriptwriter. Your task is to read the provided text "
             f"and create a natural, engaging conversation in {target_lang}."
             "\n\nRules:"
             f"\n1. {speaker_rule}"
             "\n2. Avoid showy intros or 'welcome back'. No meta talk about being a podcast."
-            f"\n4. CRITICAL: The entire conversation MUST be in {target_lang}."
-            "\n5. Make it sound like a REAL conversation. Use short turns, clarifying questions, gentle interruptions, "
+            f"\n4. {language_rule}"
+            "\n4b. If NOT using Hinglish, do not mix languages. For Hindi, use pure Hindi only "
+            "(no English words, no Hinglish/romanized Hindi). For other target languages, stay purely in that language."
+            "\n4c. Proper nouns should be transliterated into the target script when appropriate."
+            "\n5. Make it sound like a REAL conversation. Use clarifying questions, gentle interruptions, "
             "and natural filler words (e.g., 'hmm', 'yeah', 'right'). Avoid list-like recitations or reading tone."
+            "\n5b. Keep turns 2–5 sentences each and avoid alternating every sentence. "
+            "Let a speaker complete a thought (2–3 sentences) before switching."
             "\n6. Do not mention 'host', 'guest', or 'speaker' inside the spoken text."
+            f"\n7. {tts_acronym_rule}"
             f"\n6. {detail_instruction}"
             "\n7. FORMATTING IS STRICT:"
             f"\n   - {format_rule}"
@@ -237,35 +275,148 @@ class RewriteStage:
         if is_deep_dive and max_tokens < 6000:
             max_tokens = 8192
 
+        max_stage_seconds = int(os.getenv("REWRITE_MAX_SECONDS", "300"))
+        deadline = time.time() + max_stage_seconds
+
+        return {
+            "target_lang": target_lang,
+            "allow_code_switch": allow_code_switch,
+            "use_duo": use_duo,
+            "is_deep_dive": is_deep_dive,
+            "min_words": min_words,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "max_tokens": max_tokens,
+            "deadline": deadline,
+        }
+
+    def _run_openai_direct(self, text: str, ctx: JobContext, model: str) -> Tuple[str, dict]:
+        if OpenAI is None:
+            raise RuntimeError("OpenAI package not installed")
+
+        api_key = ctx.llm_api_key or os.getenv("OPENAI_API_KEY")
+        timeout_seconds = float(os.getenv("OPENAI_TIMEOUT", "180"))
+        client = OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=2)
+        config = self._build_prompt_config(text, ctx)
+
         response = client.chat.completions.create(
             model=model, # Enhanced quality
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": config["system_prompt"]},
+                {"role": "user", "content": config["user_prompt"]}
             ],
             temperature=0.7,
-            max_tokens=max_tokens,
+            max_tokens=config["max_tokens"],
         )
 
         script = response.choices[0].message.content
         script = self._strip_cringe_opening(script)
-        script = self._normalize_speaker_labels(script, use_duo)
+        script = self._normalize_speaker_labels(script, config["use_duo"])
+        if config["allow_code_switch"]:
+            script = self._normalize_hinglish_acronyms(script)
 
-        if is_deep_dive:
-            if self._word_count(script) < min_words:
+        if config["is_deep_dive"]:
+            if self._word_count(script) < config["min_words"]:
+                def generate_more(prompt: str, existing: str) -> str:
+                    response_more = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": config["system_prompt"]},
+                            {"role": "user", "content": f"{prompt}\n\nCurrent script:\n{existing}"},
+                        ],
+                        temperature=0.6,
+                        max_tokens=config["max_tokens"],
+                    )
+                    return response_more.choices[0].message.content or ""
+
                 script = self._ensure_min_words(
-                    client=client,
-                    model=model,
-                    system_prompt=system_prompt,
+                    generate_more,
                     script=script,
-                    target_words=min_words,
-                    max_tokens=max_tokens,
+                    target_words=config["min_words"],
+                    deadline=config["deadline"],
                 )
-                script = self._normalize_speaker_labels(script, use_duo)
+                script = self._normalize_speaker_labels(script, config["use_duo"])
+                if config["allow_code_switch"]:
+                    script = self._normalize_hinglish_acronyms(script)
         meta = {
             "model": model,
             "provider": "openai",
-            "target_language": target_lang
+            "target_language": config["target_lang"]
+        }
+        return script.strip(), meta
+
+    def _run_gemini_direct(self, text: str, ctx: JobContext, model: str) -> Tuple[str, dict]:
+        if genai is None:
+            raise RuntimeError("google-generativeai package not installed")
+        api_key = ctx.llm_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+
+        genai.configure(api_key=api_key)
+        config = self._build_prompt_config(text, ctx)
+
+        generation_config = {
+            "temperature": 0.7,
+            "max_output_tokens": config["max_tokens"],
+        }
+        model_name = model or "gemini-1.5-pro"
+        if model_name.startswith("gemini/"):
+            model_name = model_name.replace("gemini/", "", 1)
+
+        try:
+            model_client = genai.GenerativeModel(
+                model_name,
+                system_instruction=config["system_prompt"],
+            )
+            response = model_client.generate_content(
+                config["user_prompt"],
+                generation_config=generation_config,
+            )
+        except TypeError:
+            # Fallback for older SDKs without system_instruction
+            model_client = genai.GenerativeModel(model_name)
+            response = model_client.generate_content(
+                f"{config['system_prompt']}\n\n{config['user_prompt']}",
+                generation_config=generation_config,
+            )
+
+        script = getattr(response, "text", None)
+        if not script and getattr(response, "candidates", None):
+            try:
+                script = response.candidates[0].content.parts[0].text
+            except Exception:
+                script = ""
+        if not script:
+            script = ""
+
+        script = self._strip_cringe_opening(script)
+        script = self._normalize_speaker_labels(script, config["use_duo"])
+        if config["allow_code_switch"]:
+            script = self._normalize_hinglish_acronyms(script)
+
+        if config["is_deep_dive"]:
+            if self._word_count(script) < config["min_words"]:
+                def generate_more(prompt: str, existing: str) -> str:
+                    response_more = model_client.generate_content(
+                        f"{prompt}\n\nCurrent script:\n{existing}",
+                        generation_config={"temperature": 0.6, "max_output_tokens": config["max_tokens"]},
+                    )
+                    return getattr(response_more, "text", "") or ""
+
+                script = self._ensure_min_words(
+                    generate_more,
+                    script=script,
+                    target_words=config["min_words"],
+                    deadline=config["deadline"],
+                )
+                script = self._normalize_speaker_labels(script, config["use_duo"])
+                if config["allow_code_switch"]:
+                    script = self._normalize_hinglish_acronyms(script)
+
+        meta = {
+            "model": model_name,
+            "provider": "gemini",
+            "target_language": config["target_lang"],
         }
         return script.strip(), meta
 
@@ -274,17 +425,23 @@ class RewriteStage:
         start = time.time()
         meta: dict = {}
         use_duo = bool(ctx.voice_secondary and ctx.voice_secondary != ctx.voice)
+        provider, model = self._resolve_provider(ctx)
+        allow_code_switch = (ctx.language or "").strip().lower().startswith("hinglish")
 
-        if True: # Always attempt OpenAI first as per new instruction
-            try:
-                script, meta = self._run_openai_direct(base, ctx)
-            except Exception as exc:
-                store.append_log(ctx.job_id, f"OpenAI script generation failed; using fallback: {exc}")
-                script = self._fallback_script(base, use_duo)
-                meta = {"openai_used": False, "error": str(exc)}
+        try:
+            if provider == "gemini":
+                script, meta = self._run_gemini_direct(base, ctx, model=model)
+            else:
+                script, meta = self._run_openai_direct(base, ctx, model=model)
+        except Exception as exc:
+            store.append_log(ctx.job_id, f"LLM script generation failed; using fallback: {exc}")
+            script = self._fallback_script(base, use_duo)
+            meta = {"llm_used": False, "error": str(exc), "provider": provider}
 
         meta["elapsed_seconds"] = round(time.time() - start, 2)
         script = self._normalize_speaker_labels(script, use_duo)
+        if allow_code_switch:
+            script = self._normalize_hinglish_acronyms(script)
         meta["word_count"] = self._word_count(script)
         store.append_log(ctx.job_id, f"Script words: {meta['word_count']}")
 

@@ -12,6 +12,7 @@ const PIPELINE_STEPS = [
 
 const LANGUAGES = [
   "Hindi",
+  "Hinglish (Gen Z)",
   "English",
   "Tamil",
   "Telugu",
@@ -147,6 +148,9 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showTranscript, setShowTranscript] = useState(false);
+  const [jobStartedAt, setJobStartedAt] = useState<number | null>(null);
+  const [lastStatusAt, setLastStatusAt] = useState<number | null>(null);
+  const [pollingActive, setPollingActive] = useState(true);
   const [episodes, setEpisodes] = useState<Episode[]>(() => loadEpisodes());
   const [nowPlayingId, setNowPlayingId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -199,6 +203,7 @@ function App() {
 
   useEffect(() => {
     if (!jobId) return;
+    if (!pollingActive) return;
 
     let alive = true;
     const poll = async () => {
@@ -212,7 +217,10 @@ function App() {
         }
         if (!res.ok) return;
         const data = await res.json();
-        if (alive) setJobStatus(data);
+        if (alive) {
+          setJobStatus(data);
+          setLastStatusAt(Date.now());
+        }
         if (data.status === "completed" || data.status === "failed") {
           return;
         }
@@ -227,7 +235,23 @@ function App() {
       alive = false;
       clearInterval(interval);
     };
-  }, [jobId]);
+  }, [jobId, pollingActive]);
+
+  useEffect(() => {
+    if (!jobId || !jobStatus) return;
+    if (jobStatus.status !== "running") return;
+    if (!lastStatusAt || !jobStartedAt) return;
+
+    const interval = setInterval(() => {
+      const elapsed = Date.now() - lastStatusAt;
+      if (elapsed > 15 * 60 * 1000) {
+        setError("Job appears stuck. Please restart the job.");
+        setPollingActive(false);
+      }
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, [jobId, jobStatus, lastStatusAt, jobStartedAt]);
 
   useEffect(() => {
     if (!jobId || jobStatus?.status !== "completed") return;
@@ -390,11 +414,24 @@ function App() {
       const data = await res.json();
       setJobId(data.job_id);
       setJobStatus(null);
+      setJobStartedAt(Date.now());
+      setLastStatusAt(Date.now());
+      setPollingActive(true);
     } catch (err: any) {
       setError(err.message || "Something went wrong.");
     } finally {
       setLoading(false);
     }
+  };
+
+  const resetJob = () => {
+    setJobId(null);
+    setJobStatus(null);
+    setError(null);
+    setShowTranscript(false);
+    setPollingActive(true);
+    setJobStartedAt(null);
+    setLastStatusAt(null);
   };
 
   const scrollToSection = (id: string) => {
@@ -851,6 +888,11 @@ function App() {
               <button className="cta" onClick={handleSubmit} disabled={loading}>
                 {loading ? "Generating..." : "Generate podcast"}
               </button>
+              {jobId && (
+                <button className="pill" onClick={resetJob} type="button">
+                  Reset Job
+                </button>
+              )}
             </div>
           </div>
 
@@ -872,12 +914,12 @@ function App() {
                     value={llmProvider}
                     onChange={(e) => setLlmProvider(e.target.value)}
                   >
-                    <option value="anthropic">Anthropic</option>
-                    <option value="openai">OpenAI</option>
-                  </select>
-                </div>
-                <div className="option">
-                  <label>Model</label>
+                  <option value="openai">OpenAI</option>
+                  <option value="gemini">Gemini</option>
+                </select>
+              </div>
+              <div className="option">
+                <label>Model</label>
                   <input
                     value={llmModel}
                     onChange={(e) => setLlmModel(e.target.value)}

@@ -12,5 +12,6 @@ html2text
 pypdf
 docx2txt
 openai
+google-generativeai
 sarvamai
 python-dotenv

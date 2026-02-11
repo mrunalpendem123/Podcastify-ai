@@ -4,6 +4,7 @@ import base64
 import io
 import os
 import re
+import time
 import wave
 from typing import Iterable, List, Optional, Tuple
 
@@ -24,6 +25,9 @@ MAX_CHARS = 2500
 DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_PACE = 1.0
 DEFAULT_TEMPERATURE = 0.6
+DEFAULT_SARVAM_RETRY_MAX = 2
+DEFAULT_SARVAM_RETRY_BACKOFF = 1.5
+DEFAULT_SARVAM_FALLBACK_CHARS = 400
 
 import sys
 
@@ -32,6 +36,8 @@ def debug_log(msg: str):
 
 LANGUAGE_CODE_MAP = {
     "hindi": "hi-IN",
+    "hinglish (gen z)": "hi-IN",
+    "hinglish": "hi-IN",
     "telugu": "te-IN",
     "tamil": "ta-IN",
     "bengali": "bn-IN",
@@ -90,6 +96,11 @@ def _chunk_text(text: str, max_chars: int = MAX_CHARS) -> List[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "timed out" in msg or "timeout" in msg or "read operation timed out" in msg
 
 
 def _extract_segments(text: str) -> List[Tuple[Optional[str], str]]:
@@ -201,17 +212,46 @@ def _combine_wav(segments: Iterable[bytes], pause_seconds: float = 0.35) -> byte
     return output.getvalue()
 
 
+def _merge_segments(
+    segments: List[Tuple[Optional[str], str]],
+    max_chars: int = 1200,
+) -> List[Tuple[Optional[str], str]]:
+    merged: List[Tuple[Optional[str], str]] = []
+    for label, text in segments:
+        if not text:
+            continue
+        if not merged:
+            merged.append((label, text))
+            continue
+
+        prev_label, prev_text = merged[-1]
+        effective_label = label or prev_label
+        if effective_label == prev_label and len(prev_text) + 1 + len(text) <= max_chars:
+            merged[-1] = (prev_label, f"{prev_text} {text}".strip())
+        else:
+            merged.append((effective_label, text))
+    return merged
+
+
 class TTSStage:
     def __init__(self, files: FileStore) -> None:
         self.files = files
 
-    def _call_sarvam(self, api_key: str, text: str, language_code: str, speaker: Optional[str]) -> bytes:
+    def _call_sarvam(
+        self,
+        api_key: str,
+        text: str,
+        language_code: str,
+        speaker: Optional[str],
+        pace: Optional[float] = None,
+    ) -> bytes:
         if SarvamAI is None:
             raise RuntimeError("sarvamai package not installed. run 'pip install sarvamai'")
 
         client = SarvamAI(api_subscription_key=api_key)
         
         try:
+            pace_value = pace if pace is not None else float(os.getenv("SARVAM_PACE", DEFAULT_PACE))
             debug_log(f"Calling Sarvam SDK with text len={len(text)}, speaker={speaker}")
             # The SDK returns a response object that can be played or saved
             audio_response = client.text_to_speech.convert(
@@ -219,7 +259,7 @@ class TTSStage:
                 target_language_code=language_code,
                 model=SARVAM_MODEL,
                 speaker=speaker.lower().strip() if speaker else None,
-                pace=float(os.getenv("SARVAM_PACE", DEFAULT_PACE)),
+                pace=pace_value,
                 speech_sample_rate=DEFAULT_SAMPLE_RATE
             )
             
@@ -257,6 +297,33 @@ class TTSStage:
             debug_log(f"Sarvam SDK error: {e}")
             raise RuntimeError(f"Sarvam SDK failed: {e}")
 
+    def _call_sarvam_with_retry(
+        self,
+        api_key: str,
+        text: str,
+        language_code: str,
+        speaker: Optional[str],
+        pace: Optional[float] = None,
+    ) -> bytes:
+        retry_max = int(os.getenv("SARVAM_RETRY_MAX", str(DEFAULT_SARVAM_RETRY_MAX)))
+        backoff = float(os.getenv("SARVAM_RETRY_BACKOFF", str(DEFAULT_SARVAM_RETRY_BACKOFF)))
+        for attempt in range(retry_max + 1):
+            try:
+                return self._call_sarvam(
+                    api_key=api_key,
+                    text=text,
+                    language_code=language_code,
+                    speaker=speaker,
+                    pace=pace,
+                )
+            except Exception as exc:
+                if not _is_timeout_error(exc) or attempt >= retry_max:
+                    raise
+                sleep_for = backoff * (2 ** attempt)
+                debug_log(f"TTS timeout; retrying in {sleep_for:.2f}s (attempt {attempt + 1}/{retry_max})")
+                time.sleep(sleep_for)
+        raise RuntimeError("Sarvam TTS failed after retries")
+
     def run(self, ctx: JobContext, store: JobStore) -> None:
         api_key = ctx.sarvam_api_key or os.getenv("SARVAM_API_KEY")
         if not api_key:
@@ -267,12 +334,15 @@ class TTSStage:
         use_secondary = bool(ctx.voice_secondary and ctx.voice_secondary != ctx.voice)
         debug_log(f"Starting TTS run. Language: {language_code}, Transcript len: {len(transcript)}")
         segments = _extract_segments(transcript)
+        segments = _merge_segments(segments, max_chars=int(os.getenv("TTS_MERGE_MAX_CHARS", "1200")))
         debug_log(f"Extracted {len(segments)} segments")
 
         if not segments:
             segments = [(None, transcript)] if transcript else []
 
         audio_segments: List[bytes] = []
+        base_pace = float(os.getenv("SARVAM_PACE", DEFAULT_PACE))
+        is_hinglish = (ctx.language or "").strip().lower().startswith("hinglish")
         for index, (label, segment_text) in enumerate(segments):
             if not segment_text:
                 continue
@@ -286,21 +356,46 @@ class TTSStage:
                     speaker = ctx.voice
 
             for chunk in _chunk_text(segment_text):
-                store.append_log(
-                    ctx.job_id,
-                    f"TTS chunk ({speaker}) {len(chunk)} chars using {SARVAM_MODEL}",
-                )
+                pace = base_pace
+                if is_hinglish and (
+                    re.search(r"\b[A-Z]{2,6}s?\b", chunk)
+                    or re.search(r"\bEss El Ems\b", chunk, re.I)
+                    or re.search(r"\bEl El Ems\b", chunk, re.I)
+                    or re.search(r"\bG P T\b", chunk)
+                ):
+                    pace = max(base_pace, 1.08)
                 store.append_log(
                     ctx.job_id,
                     f"TTS chunk ({speaker}) {len(chunk)} chars using {SARVAM_MODEL}",
                 )
                 debug_log(f"Processing chunk {index}: {len(chunk)} chars, speaker: {speaker}")
                 try:
-                    audio_segments.append(self._call_sarvam(api_key, chunk, language_code, speaker))
+                    audio_segments.append(
+                        self._call_sarvam_with_retry(api_key, chunk, language_code, speaker, pace)
+                    )
                     debug_log("Chunk processed successfully")
                 except Exception as e:
-                    debug_log(f"Chunk failed: {e}")
-                    raise e
+                    if _is_timeout_error(e):
+                        fallback_max = int(
+                            os.getenv("SARVAM_FALLBACK_CHARS", str(DEFAULT_SARVAM_FALLBACK_CHARS))
+                        )
+                        if len(chunk) <= fallback_max:
+                            debug_log(f"Chunk failed after retries: {e}")
+                            raise e
+                        pieces = _chunk_text(chunk, max_chars=fallback_max)
+                        debug_log(
+                            f"TTS timeout on chunk; splitting into {len(pieces)} subchunks "
+                            f"(max_chars={fallback_max})"
+                        )
+                        for piece in pieces:
+                            if not piece:
+                                continue
+                            audio_segments.append(
+                                self._call_sarvam_with_retry(api_key, piece, language_code, speaker, pace)
+                            )
+                    else:
+                        debug_log(f"Chunk failed: {e}")
+                        raise e
 
         combined_audio = _combine_wav(audio_segments)
         audio_path = self.files.save_bytes(ctx.job_id, "audio.wav", combined_audio)
