@@ -58,3 +58,5 @@ logs/
 *.mp3
 *.wav (unless testing assets)
 *.log
+.vercel/
+.env.local
