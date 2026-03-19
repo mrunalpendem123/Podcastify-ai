@@ -15,9 +15,13 @@ from .pipeline import PipelineRunner
 
 from dotenv import load_dotenv
 
+import os
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
+# On Vercel, only /tmp is writable
+STORAGE_DIR = Path(os.environ.get("STORAGE_DIR", str(BASE_DIR / "storage")))
 
 app = FastAPI(title="Create-to-Listen API")
 app.add_middleware(
@@ -29,7 +33,7 @@ app.add_middleware(
 )
 
 store = JobStore()
-files = FileStore(BASE_DIR / "storage")
+files = FileStore(STORAGE_DIR)
 pipeline = PipelineRunner(store, files)
 
 
