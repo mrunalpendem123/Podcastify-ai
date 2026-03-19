@@ -6,20 +6,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from llama_index.core import Document, SummaryIndex, Settings
-except Exception:  # pragma: no cover - compatibility shim
-    from llama_index.core import SummaryIndex, Settings  # type: ignore
-    from llama_index.core.schema import Document  # type: ignore
-
-try:
-    from llama_index.core.node_parser import SentenceSplitter
-except Exception:  # pragma: no cover - optional
-    SentenceSplitter = None
-
-try:
-    from llama_index.llms.anthropic import Anthropic
-except Exception:  # pragma: no cover
-    Anthropic = None
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 from ..file_store import FileStore
 from ..job_store import JobStore
@@ -46,37 +35,6 @@ class SummarizationStage:
         if not isinstance(sections, list):
             return []
         return [section for section in sections if isinstance(section, dict)]
-
-    def _build_documents(self, sections: List[Dict[str, object]], fallback: str) -> List[Document]:
-        documents: List[Document] = []
-        if not sections:
-            documents.append(Document(text=fallback))
-            return documents
-
-        for section in sorted(sections, key=lambda item: item.get("order", 0)):
-            title = (section.get("title") or "").strip()
-            content = (section.get("content") or "").strip()
-            if not content:
-                continue
-            if title:
-                text = f"{title}\n{content}"
-            else:
-                text = content
-            documents.append(
-                Document(
-                    text=text,
-                    metadata={
-                        "title": title,
-                        "level": section.get("level"),
-                        "order": section.get("order"),
-                        "source": section.get("source"),
-                    },
-                )
-            )
-
-        if not documents:
-            documents.append(Document(text=fallback))
-        return documents
 
     def _sample_for_deep_dive(self, sections: List[Dict[str, object]], fallback: str, max_chars: int) -> str:
         if max_chars <= 0:
@@ -118,19 +76,13 @@ class SummarizationStage:
             return min(base_ratio, cap_ratio)
         return 1.0
 
-    def _summarize_with_llamaindex(self, documents: List[Document], ratio: float, ctx_api_key: Optional[str] = None) -> str:
-        if SentenceSplitter is not None:
-            Settings.node_parser = SentenceSplitter(chunk_size=1200, chunk_overlap=100)
+    def _summarize_with_llm(self, text: str, ratio: float, ctx_api_key: Optional[str] = None) -> str:
+        api_key = ctx_api_key or os.getenv("OPENAI_API_KEY")
+        if OpenAI is None or not api_key:
+            return text
 
-        # Configure LLM if Anthropic is available and key is present
-        api_key = ctx_api_key or os.getenv("ANTHROPIC_API_KEY")
-        if Anthropic is not None and api_key:
-            model = os.getenv("CREWAI_MODEL", "claude-3-5-sonnet-20241022").replace("anthropic/", "")
-            Settings.llm = Anthropic(model=model, api_key=api_key)
-
-        index = SummaryIndex.from_documents(documents)
-
-        summary_request = (
+        client = OpenAI(api_key=api_key, timeout=120, max_retries=2)
+        prompt = (
             "Summarize ONLY to improve listening flow. "
             "Never remove factual or technical content. "
             "Retain all facts, numbers, definitions, and cause-effect relationships. "
@@ -138,13 +90,16 @@ class SummarizationStage:
             f"Target length about {int(ratio * 100)}% of the original."
         )
 
-        try:
-            query_engine = index.as_query_engine(response_mode="tree_summarize")
-        except TypeError:
-            query_engine = index.as_query_engine()
-
-        response = query_engine.query(summary_request)
-        return str(response).strip()
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text[:60000]},
+            ],
+            temperature=0.3,
+            max_tokens=4096,
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def _evaluate_summary(self, original: str, summary: str, ratio: float) -> Tuple[bool, float]:
         if not summary:
@@ -179,12 +134,8 @@ class SummarizationStage:
             accepted = True
             actual_ratio = 1.0
         else:
-            structured_path = self.files.get_path(ctx.job_id, "structured.json")
-            sections = self._load_structured_sections(structured_path)
-            documents = self._build_documents(sections, original)
-
             try:
-                summary = self._summarize_with_llamaindex(documents, ratio, ctx.llm_api_key)
+                summary = self._summarize_with_llm(original, ratio, ctx.llm_api_key)
                 accepted, actual_ratio = self._evaluate_summary(original, summary, ratio)
                 if not accepted:
                     summary = original

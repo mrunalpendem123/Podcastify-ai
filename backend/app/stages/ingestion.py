@@ -2,25 +2,37 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+import requests
 
 try:
-    from llama_index.core import Document, SimpleDirectoryReader
-except Exception:  # pragma: no cover - compatibility shim
-    from llama_index.core import SimpleDirectoryReader  # type: ignore
-    from llama_index.core.schema import Document  # type: ignore
+    import pypdf
+except Exception:
+    pypdf = None
 
 try:
-    from llama_index.readers.web import SimpleWebPageReader
-except Exception:  # pragma: no cover - optional dependency guard
-    SimpleWebPageReader = None
+    import docx2txt
+except Exception:
+    docx2txt = None
 
-import requests # Standard library check
+try:
+    import html2text
+except Exception:
+    html2text = None
 
 from ..file_store import FileStore
 from ..job_store import JobStore
 from ..types import JobContext
+
+
+@dataclass
+class Document:
+    """Lightweight replacement for llama_index Document."""
+    text: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 NUM_HEADING_RE = re.compile(r"^(\d+(?:\.\d+){0,4}|[IVXLC]+)\s*[.)]\s+(.*)$")
@@ -33,8 +45,22 @@ class IngestionStage:
         self.files = files
 
     def _load_documents_from_file(self, path: Path) -> List[Document]:
-        reader = SimpleDirectoryReader(input_files=[str(path)])
-        return reader.load_data()
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            if pypdf is None:
+                raise RuntimeError("pypdf not installed")
+            reader = pypdf.PdfReader(str(path))
+            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+            return [Document(text=text, metadata={"source": path.name})]
+        elif suffix in (".docx", ".doc"):
+            if docx2txt is None:
+                raise RuntimeError("docx2txt not installed")
+            text = docx2txt.process(str(path))
+            return [Document(text=text or "", metadata={"source": path.name})]
+        else:
+            # Plain text / markdown / other
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            return [Document(text=text, metadata={"source": path.name})]
 
     def _load_documents_from_url(self, url: str) -> List[Document]:
         # 1. Try Jina Reader (Free, robust markdown extraction)
@@ -47,14 +73,22 @@ class IngestionStage:
         except Exception as e:
             print(f"Jina scrape failed: {e}")
 
-        # 2. Fallback to SimpleWebPageReader
-        if SimpleWebPageReader is None:
-            raise RuntimeError("SimpleWebPageReader unavailable. Install llama-index-readers-web.")
-        reader = SimpleWebPageReader(html_to_text=True)
-        return reader.load_data([url])
+        # 2. Fallback to requests + html2text
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            if html2text is not None:
+                converter = html2text.HTML2Text()
+                converter.ignore_links = False
+                text = converter.handle(resp.text)
+            else:
+                text = resp.text
+            return [Document(text=text, metadata={"source": url})]
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch URL: {e}")
 
     def _metadata_source(self, doc: Document, fallback: str) -> str:
-        metadata: Dict[str, str] = getattr(doc, "metadata", {}) or {}
+        metadata = doc.metadata or {}
         return (
             metadata.get("file_name")
             or metadata.get("file_path")

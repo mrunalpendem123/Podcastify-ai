@@ -10,5 +10,8 @@
       "src": "/api/(.*)",
       "dest": "api/index.py"
     }
-  ]
+  ],
+  "env": {
+    "STORAGE_DIR": "/tmp/sarvam_storage"
+  }
 }
