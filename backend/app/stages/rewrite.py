@@ -14,10 +14,7 @@ try:
     from openai import OpenAI
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None
-try:
-    import google.generativeai as genai
-except Exception:  # pragma: no cover - optional dependency
-    genai = None
+import requests as _requests
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -345,49 +342,37 @@ class RewriteStage:
         }
         return script.strip(), meta
 
+    def _gemini_generate(self, api_key: str, model_name: str, system: str, user: str, temperature: float, max_tokens: int) -> str:
+        """Call Gemini REST API directly (no SDK needed)."""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"parts": [{"text": user}]}],
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        }
+        resp = _requests.post(url, json=body, timeout=180)
+        resp.raise_for_status()
+        data = resp.json()
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            return ""
+
     def _run_gemini_direct(self, text: str, ctx: JobContext, model: str) -> Tuple[str, dict]:
-        if genai is None:
-            raise RuntimeError("google-generativeai package not installed")
         api_key = ctx.llm_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
 
-        genai.configure(api_key=api_key)
         config = self._build_prompt_config(text, ctx)
-
-        generation_config = {
-            "temperature": 0.7,
-            "max_output_tokens": config["max_tokens"],
-        }
         model_name = model or "gemini-1.5-pro"
         if model_name.startswith("gemini/"):
             model_name = model_name.replace("gemini/", "", 1)
 
-        try:
-            model_client = genai.GenerativeModel(
-                model_name,
-                system_instruction=config["system_prompt"],
-            )
-            response = model_client.generate_content(
-                config["user_prompt"],
-                generation_config=generation_config,
-            )
-        except TypeError:
-            # Fallback for older SDKs without system_instruction
-            model_client = genai.GenerativeModel(model_name)
-            response = model_client.generate_content(
-                f"{config['system_prompt']}\n\n{config['user_prompt']}",
-                generation_config=generation_config,
-            )
-
-        script = getattr(response, "text", None)
-        if not script and getattr(response, "candidates", None):
-            try:
-                script = response.candidates[0].content.parts[0].text
-            except Exception:
-                script = ""
-        if not script:
-            script = ""
+        script = self._gemini_generate(
+            api_key, model_name,
+            config["system_prompt"], config["user_prompt"],
+            0.7, config["max_tokens"],
+        )
 
         script = self._strip_cringe_opening(script)
         script = self._normalize_speaker_labels(script, config["use_duo"])
@@ -397,11 +382,12 @@ class RewriteStage:
         if config["is_deep_dive"]:
             if self._word_count(script) < config["min_words"]:
                 def generate_more(prompt: str, existing: str) -> str:
-                    response_more = model_client.generate_content(
+                    return self._gemini_generate(
+                        api_key, model_name,
+                        config["system_prompt"],
                         f"{prompt}\n\nCurrent script:\n{existing}",
-                        generation_config={"temperature": 0.6, "max_output_tokens": config["max_tokens"]},
+                        0.6, config["max_tokens"],
                     )
-                    return getattr(response_more, "text", "") or ""
 
                 script = self._ensure_min_words(
                     generate_more,
